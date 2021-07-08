@@ -872,18 +872,29 @@ impl PciDevice for VfioPciDevice {
     ) -> Result<PciAddress, PciDeviceError> {
         if self.pci_address.is_none() {
             let address = PciAddress::from_string(self.device.device_name());
-            if resources.reserve_pci(
-                Alloc::PciBar {
-                    bus: address.bus,
-                    dev: address.dev,
-                    func: address.func,
-                    bar: 0,
-                },
-                self.debug_label(),
-            ) {
-                self.pci_address = Some(address);
+            self.pci_address = match resources.allocate_pci(self.debug_label()) {
+                Some(Alloc::PciBar {
+                    bus,
+                    dev,
+                    func,
+                    bar: _,
+                }) => Some(PciAddress {bus, dev, func}),
+                _ => None,
             }
         }
+
+        //     if resources.reserve_pci(
+        //         Alloc::PciBar {
+        //             bus: 0,// address.bus,
+        //             dev: 8,// address.dev,
+        //             func: 0,// address.func,
+        //             bar: 0,
+        //         },
+        //         self.debug_label(),
+        //     ) {
+        //         self.pci_address = Some(PciAddress {0, 8, 0});// Some(address);
+        //     }
+        // }
         self.pci_address.ok_or(PciDeviceError::PciAllocationFailed)
     }
 
