@@ -1471,11 +1471,13 @@ fn create_vfio_device(
     cfg: &Config,
     vm: &impl Vm,
     resources: &mut SystemAllocator,
+    exit_evt: &Event,
     control_tubes: &mut Vec<TaggedControlTube>,
     vfio_path: &Path,
     kvm_vfio_file: &SafeDescriptor,
     endpoints: &mut BTreeMap<u32, Arc<Mutex<VfioContainer>>>,
     iommu_enabled: bool,
+    vfio_device_tube: Option<Tube>,
 ) -> DeviceResult<(Box<VfioPciDevice>, Option<Minijail>)> {
     let vfio_container = VfioCommonSetup::vfio_get_container(vfio_path, iommu_enabled)
         .map_err(Error::CreateVfioDevice)?;
@@ -1503,6 +1505,8 @@ fn create_vfio_device(
         vfio_device_tube_msi,
         vfio_device_tube_msix,
         vfio_device_tube_mem,
+        vfio_device_tube,
+        exit_evt.try_clone().map_err(Error::CloneEvent)?,
     ));
     // early reservation for pass-through PCI devices.
     let endpoint_addr = vfio_pci_device.allocate_address(resources);
@@ -1535,6 +1539,7 @@ fn create_devices(
     fs_device_tubes: &mut Vec<Tube>,
     #[cfg(feature = "usb")] usb_provider: HostBackendDeviceProvider,
     map_request: Arc<Mutex<Option<ExternalMapping>>>,
+    vfio_device_tube: Tube,
 ) -> DeviceResult<Vec<(Box<dyn PciDevice>, Option<Minijail>)>> {
     let stubs = create_virtio_devices(
         &cfg,
@@ -1584,19 +1589,27 @@ fn create_devices(
         let mut iommu_attached_endpoints: BTreeMap<u32, Arc<Mutex<VfioContainer>>> =
             BTreeMap::new();
 
+        let mut vfio_device_gpu_tube = Some(vfio_device_tube);
         for (vfio_path, enable_iommu) in cfg.vfio.iter() {
             let (vfio_pci_device, jail) = create_vfio_device(
                 cfg,
                 vm,
                 resources,
+                exit_evt,
                 control_tubes,
                 vfio_path.as_path(),
                 &kvm_vfio_file,
                 &mut iommu_attached_endpoints,
                 *enable_iommu,
+                vfio_device_gpu_tube,
             )?;
 
             pci_devices.push((vfio_pci_device, jail));
+            //WARNING: hacking to assume the first VFIO device is the passthrough GPU.
+            //Fixme: need a way to identify the passthrough GPU during boot and only
+            // let the passthrough GPU have the chance to enable the dynamic map/unmap
+            // mechanism.
+            vfio_device_gpu_tube = None;
         }
 
         if !iommu_attached_endpoints.is_empty() {
@@ -2343,6 +2356,8 @@ where
         .set_recv_timeout(Some(Duration::from_millis(100)))
         .map_err(Error::CreateTube)?;
 
+    let (vfio_host_tube, vfio_device_tube) = Tube::pair().map_err(Error::CreateTube)?;
+
     // Create one control socket per disk.
     let mut disk_device_tubes = Vec::new();
     let mut disk_host_tubes = Vec::new();
@@ -2431,6 +2446,7 @@ where
         #[cfg(feature = "usb")]
         usb_provider,
         Arc::clone(&map_request),
+        vfio_device_tube,
     )?;
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -2516,6 +2532,7 @@ where
         &disk_host_tubes,
         #[cfg(feature = "usb")]
         usb_control_tube,
+        vfio_host_tube,
         exit_evt,
         sigchld_fd,
         cfg.sandbox,
@@ -2550,6 +2567,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     balloon_host_tube: Tube,
     disk_host_tubes: &[Tube],
     #[cfg(feature = "usb")] usb_control_tube: Tube,
+    vfio_client_socket: Tube,
     exit_evt: Event,
     sigchld_fd: SignalFd,
     sandbox: bool,
@@ -2805,6 +2823,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                                             &mut sys_allocator,
                                             Arc::clone(&map_request),
                                             &mut gralloc,
+                                            &vfio_client_socket,
                                         );
                                         if let Err(e) = tube.send(&response) {
                                             error!("failed to send VmMemoryControlResponse: {}", e);

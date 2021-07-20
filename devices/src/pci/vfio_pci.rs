@@ -5,16 +5,24 @@
 use std::sync::Arc;
 use std::u32;
 
+use libc::EINVAL;
+use std::thread;
+
 use base::{
-    error, pagesize, AsRawDescriptor, Event, MappedRegion, MemoryMapping, MemoryMappingBuilder,
-    RawDescriptor, Tube,
+    error, pagesize, wrap_descriptor, AsRawDescriptor, Event, MappedRegion, MemoryMapping,
+    MemoryMappingBuilder, PollContext, PollToken, RawDescriptor, Tube,
 };
 use hypervisor::Datamatch;
 
 use resources::{Alloc, MmioType, SystemAllocator};
 
+use sys_util::Error as SysError;
+
 use vfio_sys::*;
-use vm_control::{VmIrqRequest, VmIrqResponse, VmMemoryRequest, VmMemoryResponse};
+use vm_control::{
+    VfioDriverRequest, VfioDriverResponse, VmIrqRequest, VmIrqResponse, VmMemoryRequest,
+    VmMemoryResponse,
+};
 
 use crate::pci::msix::{
     MsixConfig, BITS_PER_PBA_ENTRY, MSIX_PBA_ENTRIES_MODULO, MSIX_TABLE_ENTRIES_MODULO,
@@ -25,6 +33,10 @@ use crate::pci::{
     PciAddress, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciClassCode,
     PciInterruptPin,
 };
+
+use std::collections::BTreeMap;
+
+use vm_control::MemSlot;
 
 use crate::vfio::{VfioDevice, VfioIrqType};
 
@@ -438,6 +450,9 @@ pub struct VfioPciDevice {
 
     // scratch MemoryMapping to avoid unmap beform vm exit
     mem: Vec<MemoryMapping>,
+    service_socket: Option<Tube>,
+    active_thread: bool,
+    exit_evt: Event,
 }
 
 impl VfioPciDevice {
@@ -447,6 +462,8 @@ impl VfioPciDevice {
         vfio_device_socket_msi: Tube,
         vfio_device_socket_msix: Tube,
         vfio_device_socket_mem: Tube,
+        vfio_device_socket: Option<Tube>,
+        exit_evt: Event,
     ) -> Self {
         let dev = Arc::new(device);
         let config = VfioPciConfig::new(Arc::clone(&dev));
@@ -498,6 +515,9 @@ impl VfioPciDevice {
             vm_socket_mem: vfio_device_socket_mem,
             device_data,
             mem: Vec::new(),
+            service_socket: vfio_device_socket,
+            active_thread: false,
+            exit_evt,
         }
     }
 
@@ -740,6 +760,104 @@ impl VfioPciDevice {
             let mut mem_map = self.add_bar_mmap(mmio_info.bar_index() as u32, mmio_info.address());
             self.mem.append(&mut mem_map);
         }
+    }
+
+    fn activate_thread(&mut self, device: Arc<VfioDevice>) {
+        /* start vfio service thread for dma map */
+        let service_socket = self.service_socket.take().unwrap();
+        let mut dma_bufs: BTreeMap<MemSlot, (u64, u64)> = BTreeMap::new();
+
+        let exit_evt = match self.exit_evt.try_clone() {
+            Ok(e) => e,
+            Err(e) => {
+                error!("failed to clone exit_evt: {}", e);
+                return;
+            }
+        };
+
+        let thread_result = thread::Builder::new()
+            .name("vfio".to_string())
+            .spawn(move || {
+                #[derive(PollToken)]
+                enum Token {
+                    VfioRequest,
+                    Exit,
+                }
+                let poll_ctx: PollContext<Token> = match PollContext::new()
+                    .and_then(|pc| pc.add(&wrap_descriptor(&service_socket), Token::VfioRequest).and(Ok(pc)))
+                    .and_then(|pc| pc.add(&wrap_descriptor(&exit_evt), Token::Exit).and(Ok(pc)))
+                {
+                    Ok(pc) => pc,
+                    Err(e) => {
+                        error!("failed creating PollContext: {}", e);
+                        return;
+                    }
+                };
+
+                'poll: loop {
+                    let events = match poll_ctx.wait() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("failed polling for events: {}", e);
+                            break;
+                        }
+                    };
+
+                   for event in events.iter_readable() {
+                        match event.token() {
+                            Token::VfioRequest => {
+                                let req = match service_socket.recv() {
+                                    Ok(req) => req,
+                                    Err(e) => {
+                                        error!("service socket failed recv: {:?}", e);
+                                        if poll_ctx.delete(&wrap_descriptor(&service_socket)).is_err() {
+                                            error!("failed to delete vfio service_socket from poll_context");
+                                        }
+                                        break;
+                                    }
+                                    };
+                                let resp = match req {
+                                    VfioDriverRequest::DmaMap(slot, iova, size, host_addr) => {
+                                        match unsafe { device.vfio_dma_map(iova, size, host_addr) } {
+                                            Ok(()) => {
+                                                dma_bufs.insert(slot, (iova, size));
+                                                VfioDriverResponse::Ok
+                                            }
+                                            _ => VfioDriverResponse::Err(SysError::new(EINVAL)),
+                                        }
+                                    }
+                                    VfioDriverRequest::DmaUnmap(slot) => {
+                                        if let Some((iova, size)) = dma_bufs.remove(&slot) {
+                                            match device.vfio_dma_unmap(iova, size) {
+                                                Ok(()) => VfioDriverResponse::Ok,
+                                                _ => VfioDriverResponse::Err(SysError::new(EINVAL)),
+                                            }
+                                        } else {
+                                            VfioDriverResponse::Err(SysError::new(EINVAL))
+                                        }
+                                    }
+                                };
+
+                               if let Err(e) = service_socket.send(&resp) {
+                                    error!("service socket failed send: {:?}", e);
+                                    if poll_ctx.delete(&wrap_descriptor(&service_socket)).is_err() {
+                                        error!("failed to delete vfio service_socket from poll_context");
+                                    }
+                                    break;
+                                }
+                            }
+                            Token::Exit => break 'poll,
+                        }
+                    }
+                }
+            });
+
+        if let Err(e) = thread_result {
+            error!("failed to spawn vfio thread: {}", e);
+            return;
+        }
+
+        self.active_thread = true;
     }
 }
 
@@ -1010,6 +1128,10 @@ impl PciDevice for VfioPciDevice {
     }
 
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        if !self.active_thread {
+            self.activate_thread(self.device.clone());
+        }
+
         let start = (reg_idx * 4) as u64 + offset;
 
         let mut msi_change: Option<VfioMsiChange> = None;

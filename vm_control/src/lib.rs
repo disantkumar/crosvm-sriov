@@ -305,23 +305,38 @@ impl VmMemoryRequest {
         sys_allocator: &mut SystemAllocator,
         map_request: Arc<Mutex<Option<ExternalMapping>>>,
         gralloc: &mut RutabagaGralloc,
+        vfio_client_sock: &Tube,
     ) -> VmMemoryResponse {
         use self::VmMemoryRequest::*;
         match self {
             RegisterMemory(ref shm) => {
-                match register_memory(vm, sys_allocator, shm, shm.size() as usize, None) {
+                match register_memory(vm, sys_allocator, shm, shm.size() as usize, None, None) {
                     Ok((pfn, slot)) => VmMemoryResponse::RegisterMemory { pfn, slot },
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
             RegisterFdAtPciBarOffset(alloc, ref descriptor, size, offset) => {
-                match register_memory(vm, sys_allocator, descriptor, size, Some((alloc, offset))) {
+                match register_memory(
+                    vm,
+                    sys_allocator,
+                    descriptor,
+                    size,
+                    Some((alloc, offset)),
+                    None,
+                ) {
                     Ok((pfn, slot)) => VmMemoryResponse::RegisterMemory { pfn, slot },
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
             UnregisterMemory(slot) => match vm.remove_memory_region(slot) {
-                Ok(_) => VmMemoryResponse::Ok,
+                Ok(_) => {
+                    let response =
+                        vfio_request(vfio_client_sock, VfioDriverRequest::DmaUnmap(slot));
+                    match response {
+                        Ok(VfioDriverResponse::Ok) => VmMemoryResponse::Ok,
+                        _ => VmMemoryResponse::Err(SysError::new(EINVAL)),
+                    }
+                }
                 Err(e) => VmMemoryResponse::Err(e),
             },
             RegisterHostPointerAtPciBarOffset(alloc, offset) => {
@@ -416,6 +431,7 @@ impl VmMemoryRequest {
                     &handle.os_handle,
                     reqs.size as usize,
                     None,
+                    Some(vfio_client_sock),
                 ) {
                     Ok((pfn, slot)) => VmMemoryResponse::AllocateAndRegisterGpuMemory {
                         // Safe because ownership is transferred to SafeDescriptor via
@@ -915,12 +931,74 @@ pub enum VmRequest {
     BatCommand(BatteryType, BatControlCommand),
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum VfioDriverRequest {
+    /// Add guest memory into vfio iommu mmap table
+    DmaMap(MemSlot, u64, u64, u64),
+    /// Del guest memory from vfio iommu mmap table which was previously added with 'DmaMap'
+    DmaUnmap(MemSlot),
+}
+
+fn vfio_request(vfio_client_socket: &Tube, req: VfioDriverRequest) -> Result<VfioDriverResponse> {
+    let ret; // VfioDriverResponse::Ok;
+
+    if let Err(e) = vfio_client_socket.send(&req) {
+        error!("client_socket send failed: {:?}", e);
+        return Err(SysError::new(EINVAL));
+    } else {
+        match vfio_client_socket.recv() {
+            Err(e) => {
+                error!("client_socket recv failed: {:?}", e);
+                return Err(SysError::new(EINVAL));
+            }
+            Ok(VfioDriverResponse::Err(e)) => {
+                error!("client_socket recv error response: {:?}", e);
+                return Err(e);
+            }
+            Ok(t) => ret = t,
+        }
+    }
+
+    Ok(ret)
+}
+
+impl VfioDriverRequest {
+    /// Executes this request on the given Vm.
+    ///
+    /// # Arguments
+    /// * `vm` - The `Vm` to perform the request on.
+    ///
+    /// This does not return a result, instead encapsulating the success or failure in a
+    /// `VfioDriverResponse` with the intended purpose of sending the response back over the socket
+    /// that received this `VfioDriverResponse`.
+    pub fn execute(&self, _vm: &mut dyn Vm, _vfio_client_socket: &Tube) -> VfioDriverResponse {
+        use self::VfioDriverRequest::*;
+        match *self {
+            DmaMap(_slot, _gpa, _size, _host) => {
+                error!("vfio host socket receive invalid DmaMap request");
+                VfioDriverResponse::Err(SysError::new(EINVAL))
+            }
+            DmaUnmap(_slot) => {
+                error!("vfio host socket receive invalid DmaUnmap request");
+                VfioDriverResponse::Err(SysError::new(EINVAL))
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum VfioDriverResponse {
+    Ok,
+    Err(SysError),
+}
+
 fn register_memory(
     vm: &mut impl Vm,
     allocator: &mut SystemAllocator,
     descriptor: &dyn AsRawDescriptor,
     size: usize,
     pci_allocation: Option<(Alloc, u64)>,
+    vfio_device_sock: Option<&Tube>,
 ) -> Result<(u64, MemSlot)> {
     let mmap = match MemoryMappingBuilder::new(size)
         .from_descriptor(descriptor)
@@ -930,6 +1008,8 @@ fn register_memory(
         Err(MmapError::SystemCallFailed(e)) => return Err(e),
         _ => return Err(SysError::new(EINVAL)),
     };
+
+    let host_addr: u64 = mmap.as_ptr() as u64;
 
     let addr = match pci_allocation {
         Some(pci_allocation) => allocator
@@ -946,6 +1026,13 @@ fn register_memory(
     };
 
     let slot = vm.add_memory_region(GuestAddress(addr), Box::new(mmap), false, false)?;
+
+    if let Some(vfio_sock) = vfio_device_sock {
+        vfio_request(
+            vfio_sock,
+            VfioDriverRequest::DmaMap(slot, addr, size as u64, host_addr),
+        )?;
+    }
 
     Ok((addr >> 12, slot))
 }
