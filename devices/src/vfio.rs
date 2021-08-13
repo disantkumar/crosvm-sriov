@@ -52,7 +52,7 @@ pub enum VfioError {
 impl fmt::Display for VfioError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            VfioError::OpenContainer(e) => write!(f, "failed to open /dev/vfio/vfio container: {}", e),
+            VfioError::OpenContainer(e) => write!(f, "failed to open /dev/vfio/vfio container: CARLOS2 {}", e),
             VfioError::OpenGroup(e) => write!(f, "failed to open /dev/vfio/$group_num group: {}", e),
             VfioError::GetGroupStatus(e) => write!(f, "failed to get Group Status: {}", e),
             VfioError::BorrowVfioContainer => write!(f, "failed to borrow global vfio container"),
@@ -91,18 +91,20 @@ const VFIO_API_VERSION: u8 = 0;
 impl VfioContainer {
     /// Open VfioContainer
     pub fn new() -> Result<Self, VfioError> {
+    	warn!("CARLOSS 94 : VfioContainer::new()");
         let container = OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/vfio/vfio")
             .map_err(VfioError::OpenContainer)?;
-
-        // Safe as file is vfio container descriptor and ioctl is defined by kernel.
+	warn!("CARLOSS 99: new( VFIO_GET_API_VERSION )");
+        //Safe as file is vfio container descriptor and ioctl is defined by kernel.
         let version = unsafe { ioctl(&container, VFIO_GET_API_VERSION()) };
         if version as u8 != VFIO_API_VERSION {
+            warn!("CARLOSS 103:");
             return Err(VfioError::VfioApiVersion);
         }
-
+	warn!("CARLOSS 106:");
         Ok(VfioContainer {
             container,
             groups: HashMap::new(),
@@ -110,24 +112,28 @@ impl VfioContainer {
     }
 
     fn is_group_set(&self, group_id: u32) -> bool {
+    	warn!("CARLOSS 114:");
         self.groups.get(&group_id).is_some()
     }
 
     fn check_extension(&self, val: u32) -> bool {
+	warn!("CARLOSS 119: check_extension(VFIO_TYPE1v2_IOMMU)");
         if val != VFIO_TYPE1_IOMMU && val != VFIO_TYPE1v2_IOMMU {
             panic!("IOMMU type error");
         }
 
+	warn!("CARLOSS 124: check_extension(VFIO_CHECK_EXTENSION)");
         // Safe as file is vfio container and make sure val is valid.
         let ret = unsafe { ioctl_with_val(self, VFIO_CHECK_EXTENSION(), val.into()) };
         ret == 1
     }
 
     fn set_iommu(&self, val: u32) -> i32 {
+    warn!("CARLOSS 131:");
         if val != VFIO_TYPE1_IOMMU && val != VFIO_TYPE1v2_IOMMU {
             panic!("IOMMU type error");
         }
-
+	warn!("CARLOSS 135: set_iommu(VFIO_SET_IOMMU)");
         // Safe as file is vfio container and make sure val is valid.
         unsafe { ioctl_with_val(self, VFIO_SET_IOMMU(), val.into()) }
     }
@@ -150,12 +156,12 @@ impl VfioContainer {
         if write_en {
             dma_map.flags |= VFIO_DMA_MAP_FLAG_WRITE;
         }
-
+	warn!("CARLY 154: vfio_dma_map(VFIO_IOMMU_MAP_DMA) size: {}", size);
         let ret = ioctl_with_ref(self, VFIO_IOMMU_MAP_DMA(), &dma_map);
         if ret != 0 {
             return Err(VfioError::IommuDmaMap(get_error()));
         }
-
+	warn!("CARLOSS 157: vfio_dma_map(OK)");
         Ok(())
     }
 
@@ -174,6 +180,7 @@ impl VfioContainer {
             return Err(VfioError::IommuDmaUnmap(get_error()));
         }
 
+	warn!("CARLOSS 176: vfio_dma_unmap()");
         Ok(())
     }
 
@@ -191,27 +198,33 @@ impl VfioContainer {
             return Err(VfioError::IommuGetInfo(get_error()));
         }
 
+	warn!("CARLOSS 194:");
         Ok(iommu_info.iova_pgsizes)
     }
 
     fn init(&mut self, guest_mem: &GuestMemory, iommu_enabled: bool) -> Result<(), VfioError> {
+    	warn!("CARLOSS 199:");
         if !self.check_extension(VFIO_TYPE1v2_IOMMU) {
             return Err(VfioError::VfioType1V2);
         }
-
+	warn!("CARLOSS 203: set_iommu(VFIO_TYPE1v2_IOMMU)");
         if self.set_iommu(VFIO_TYPE1v2_IOMMU) < 0 {
+        	warn!("CARLOSS 206: error set_iommu(VFIO_TYPE1v2_IOMMU)");
             return Err(VfioError::ContainerSetIOMMU(get_error()));
         }
 
         // Add all guest memory regions into vfio container's iommu table,
         // then vfio kernel driver could access guest memory from gfn
         if !iommu_enabled {
+        	warn!("CARLOSS 211:");
+        	let size = 2147482548;
             guest_mem.with_regions(|_index, guest_addr, size, host_addr, _mmap, _fd_offset| {
                 // Safe because the guest regions are guaranteed not to overlap
                 unsafe { self.vfio_dma_map(guest_addr.0, size as u64, host_addr as u64, true) }
             })?;
         }
 
+	warn!("CARLOSS 218:");
         Ok(())
     }
 
@@ -227,16 +240,19 @@ impl VfioContainer {
             None => {
                 let group = Arc::new(VfioGroup::new(self, id)?);
 
+		warn!("CARLOSS 234:");
                 if self.groups.is_empty() {
                     // Before the first group is added into container, do once cotainer
                     // initialize for a vm
+                    warn!("CARLOSS 237:");
                     self.init(guest_mem, iommu_enabled)?;
                 }
-
+		warn!("CARLOSS 242:");
                 group.kvm_device_add_group(kvm_vfio_file)?;
-
+		warn!("CARLOSS 244:");
                 self.groups.insert(id, group.clone());
 
+		warn!("CARLOSS 247:");
                 Ok(group)
             }
         }
@@ -257,8 +273,10 @@ impl VfioGroup {
     fn new(container: &VfioContainer, id: u32) -> Result<Self, VfioError> {
         let mut group_path = String::from("/dev/vfio/");
         let s_id = &id;
+        warn!("CARLOSSS 269: Step: /* Open the group */");
         group_path.push_str(s_id.to_string().as_str());
 
+	warn!("CARLOSS 273:");
         let group_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -273,16 +291,19 @@ impl VfioGroup {
         let mut ret =
             unsafe { ioctl_with_mut_ref(&group_file, VFIO_GROUP_GET_STATUS(), &mut group_status) };
         if ret < 0 {
+        	warn!("CARLOSS 285:");
             return Err(VfioError::GetGroupStatus(get_error()));
         }
 
         if group_status.flags != VFIO_GROUP_FLAGS_VIABLE {
+        	warn!("CARLOSS 290:");
             return Err(VfioError::GroupViable);
         }
 
         // Safe as we are the owner of group_file and container_raw_descriptor which are valid value,
         // and we verify the ret value
         let container_raw_descriptor = container.as_raw_descriptor();
+        warn!("CARLOSS 300: Step: /* Add the group to the container */");
         ret = unsafe {
             ioctl_with_ref(
                 &group_file,
@@ -291,9 +312,11 @@ impl VfioGroup {
             )
         };
         if ret < 0 {
+        	warn!("CARLOSS 307:");
             return Err(VfioError::GroupSetContainer(get_error()));
         }
 
+	warn!("CARLOSS 310:");
         Ok(VfioGroup { group: group_file })
     }
 
@@ -308,6 +331,7 @@ impl VfioGroup {
             .parse::<u32>()
             .map_err(|_| VfioError::InvalidPath)?;
 
+	warn!("CARLOSS 322: get_group_id()");
         Ok(group_id)
     }
 
@@ -330,15 +354,18 @@ impl VfioGroup {
                 &vfio_dev_attr,
             )
         } {
+            warn!("CARLOSS 345:");
             return Err(VfioError::KvmSetDeviceAttr(get_error()));
         }
 
+	warn!("CARLOSS 348:");
         Ok(())
     }
 
     fn get_device(&self, name: &str) -> Result<File, VfioError> {
         let path: CString = CString::new(name.as_bytes()).expect("CString::new() failed");
         let path_ptr = path.as_ptr();
+        warn!("CARLOSS 356:");
 
         // Safe as we are the owner of self and path_ptr which are valid value.
         let ret = unsafe { ioctl_with_ptr(self, VFIO_GROUP_GET_DEVICE_FD(), path_ptr) };
@@ -395,22 +422,27 @@ impl VfioCommonTrait for VfioCommonSetup {
     ) -> Result<Arc<Mutex<VfioContainer>>, VfioError> {
         match iommu_enabled {
             false => {
+                warn!("CARLOSS : 417 vfio_get_container()");
                 // One VFIO container is used for all IOMMU disabled groups
                 NO_IOMMU_CONTAINER.with(|v| {
                     if v.borrow().is_some() {
+			warn!("CARLOSS : 421 vfio_get_container()");
                         if let Some(ref container) = *v.borrow() {
                             Ok(container.clone())
                         } else {
                             Err(VfioError::BorrowVfioContainer)
                         }
                     } else {
+                        warn!("CARLOSS : 428 vfio_get_container()");
                         let container = Arc::new(Mutex::new(VfioContainer::new()?));
                         *v.borrow_mut() = Some(container.clone());
+                        warn!("CARLOSS : 432 vfio_get_container()");
                         Ok(container)
                     }
                 })
             }
             true => {
+            	warn!("CARLOSS : 436 vfio_get_container()");
                 let group_id = VfioGroup::get_group_id(sysfspath)?;
 
                 // One VFIO container is used for all devices belong to one VFIO group
@@ -479,6 +511,7 @@ impl VfioDevice {
         container: Arc<Mutex<VfioContainer>>,
         iommu_enabled: bool,
     ) -> Result<Self, VfioError> {
+        warn!("CARLOSS 497");
         let group_id = VfioGroup::get_group_id(sysfspath)?;
         let group =
             container
@@ -487,6 +520,7 @@ impl VfioDevice {
         let name_osstr = sysfspath.file_name().ok_or(VfioError::InvalidPath)?;
         let name_str = name_osstr.to_str().ok_or(VfioError::InvalidPath)?;
         let name = String::from(name_str);
+        warn!("CARLOSS 505");
         let dev = group.get_device(&name)?;
         let regions = Self::get_regions(&dev)?;
 
@@ -531,8 +565,10 @@ impl VfioDevice {
         // Safe as we are the owner of self and irq_set which are valid value
         let ret = unsafe { ioctl_with_ref(&self.dev, VFIO_DEVICE_SET_IRQS(), &irq_set[0]) };
         if ret < 0 {
+            warn!("CARLOSS 551");
             Err(VfioError::VfioIrqEnable(get_error()))
         } else {
+            warn!("CARLOSS 554");
             Ok(())
         }
     }
