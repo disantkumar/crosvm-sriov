@@ -817,8 +817,8 @@ impl VfioPciDevice {
                                     }
                                     };
                                 let resp = match req {
-                                    VfioDriverRequest::DmaMap(slot, iova, size, host_addr) => {
-                                        match unsafe { device.vfio_dma_map(iova, size, host_addr) } {
+                                    VfioDriverRequest::DmaMap(slot, iova, size, host_addrm) => {
+                                        match unsafe { device.vfio_dma_map(iova, size, host_addrm, true) } {
                                             Ok(()) => {
                                                 dma_bufs.insert(slot, (iova, size));
                                                 VfioDriverResponse::Ok
